@@ -149,7 +149,7 @@ def gestisci_partita_live(club_name, is_host):
             st.success("Salvato!")
             st.rerun()
 
-def mostra_statistiche(club_name):
+def mostra_statistiche(club_name, is_host):
     df = carica_dati_club(club_name)
     if df.empty:
         st.info("Nessuna partita registrata in questo club.")
@@ -181,166 +181,184 @@ def mostra_statistiche(club_name):
     tab_pers, tab_club = st.tabs(["👤 Statistiche Personali", "🏆 Statistiche Globali Club"])
     
     with tab_pers:
-        giocatori_disponibili = sorted(df["Giocatore"].unique())
-        default_index = 0
-        if st.session_state.username in giocatori_disponibili:
-            default_index = giocatori_disponibili.index(st.session_state.username)
-        selected_player = st.selectbox("Analizza Giocatore:", giocatori_disponibili, index=default_index)
+        # --- LOGICA PERMESSI ---
+        # Se è HOST: vede tutti
+        # Se è MEMBER: vede solo se stesso
+        tutti_giocatori = sorted(df["Giocatore"].unique())
         
-        all_dates = sorted(df_filtered["Data"].unique())
-        full_timeline = pd.DataFrame({"Data": all_dates})
-        player_data = df_filtered[df_filtered["Giocatore"] == selected_player].copy()
-        df_p = pd.merge(full_timeline, player_data, on="Data", how="left")
-        df_p["Giocatore"] = selected_player
-        df_p["Profitto"] = df_p["Profitto"].fillna(0)
-        df_p["BuyIn"] = df_p["BuyIn"].fillna(0)
-        df_p = df_p.sort_values("Data")
-        df_active = df_p[df_p["BuyIn"] > 0].copy() 
-        
-        if df_active.empty and df_p["Profitto"].sum() == 0:
-            st.warning(f"Nessuna partita giocata per {selected_player} in questo periodo.")
+        if is_host:
+            options = tutti_giocatori
+            # Cerca di selezionare l'host di default se presente
+            default_idx = 0
+            if st.session_state.username in options:
+                default_idx = options.index(st.session_state.username)
         else:
-            total_profit = df_p["Profitto"].sum()
-            total_buyin = df_active["BuyIn"].sum()
-            n_sessions_played = len(df_active)
-            total_club_sessions = len(all_dates)
+            # Filtra solo se stesso
+            if st.session_state.username in tutti_giocatori:
+                options = [st.session_state.username]
+                default_idx = 0
+            else:
+                options = []
+        
+        if not options:
+            st.warning("Non hai ancora giocato nessuna partita, quindi non ci sono statistiche personali da mostrare.")
+        else:
+            selected_player = st.selectbox("Analizza Giocatore:", options, index=default_idx)
             
-            attendance_pct = (n_sessions_played / total_club_sessions * 100) if total_club_sessions > 0 else 0
-            roi = (total_profit / total_buyin * 100) if total_buyin > 0 else 0
+            # Da qui in poi il codice è identico, usa selected_player
+            all_dates = sorted(df_filtered["Data"].unique())
+            full_timeline = pd.DataFrame({"Data": all_dates})
+            player_data = df_filtered[df_filtered["Giocatore"] == selected_player].copy()
+            df_p = pd.merge(full_timeline, player_data, on="Data", how="left")
+            df_p["Giocatore"] = selected_player
+            df_p["Profitto"] = df_p["Profitto"].fillna(0)
+            df_p["BuyIn"] = df_p["BuyIn"].fillna(0)
+            df_p = df_p.sort_values("Data")
+            df_active = df_p[df_p["BuyIn"] > 0].copy() 
             
-            max_win = df_active["Profitto"].max() if not df_active.empty else 0
-            max_loss = df_active["Profitto"].min() if not df_active.empty else 0
-            
-            wins_df = df_active[df_active["Profitto"] > 0]
-            losses_df = df_active[df_active["Profitto"] < 0]
-            avg_win = wins_df["Profitto"].mean() if not wins_df.empty else 0
-            avg_loss = losses_df["Profitto"].mean() if not losses_df.empty else 0
-            n_wins = len(wins_df)
-            win_rate = (n_wins / n_sessions_played * 100) if n_sessions_played > 0 else 0
-            std_dev = df_active["Profitto"].std()
-            if pd.isna(std_dev): std_dev = 0
-            
-            max_win_streak_count = 0; max_win_streak_money = 0; best_money_streak_val = 0; best_money_streak_count = 0
-            max_loss_streak_count = 0; max_loss_streak_money = 0; worst_money_streak_val = 0; worst_money_streak_count = 0
-            current_streak_type = 0; current_count = 0; current_sum = 0
-            profits_loop = df_active["Profitto"].tolist() + [0] 
-            
-            for val in profits_loop:
-                tipo_attuale = 1 if val > 0 else (-1 if val < 0 else 0)
-                if tipo_attuale == 0: 
-                    if current_streak_type == 1:
-                        if current_count > max_win_streak_count: max_win_streak_count = current_count; max_win_streak_money = current_sum
-                        if current_sum > best_money_streak_val: best_money_streak_val = current_sum; best_money_streak_count = current_count
-                    elif current_streak_type == -1:
-                        if current_count > max_loss_streak_count: max_loss_streak_count = current_count; max_loss_streak_money = current_sum
-                        if current_sum < worst_money_streak_val: worst_money_streak_val = current_sum; worst_money_streak_count = current_count
-                    current_streak_type = 0; current_count = 0; current_sum = 0
-                    continue
-                if tipo_attuale == current_streak_type:
-                    current_count += 1; current_sum += val
-                else:
-                    if current_streak_type == 1: 
-                        if current_count > max_win_streak_count: max_win_streak_count = current_count; max_win_streak_money = current_sum
-                        if current_sum > best_money_streak_val: best_money_streak_val = current_sum; best_money_streak_count = current_count
-                    elif current_streak_type == -1: 
-                        if current_count > max_loss_streak_count: max_loss_streak_count = current_count; max_loss_streak_money = current_sum
-                        if current_sum < worst_money_streak_val: worst_money_streak_val = current_sum; worst_money_streak_count = current_count
-                    current_streak_type = tipo_attuale; current_count = 1; current_sum = val
-            
-            # --- FIX SINTASSI QUI SOTTO ---
-            curr_streak = 0
-            for p in df_active["Profitto"].iloc[::-1]:
-                if p > 0:
-                    if curr_streak >= 0:
-                        curr_streak += 1
+            if df_active.empty and df_p["Profitto"].sum() == 0:
+                st.warning(f"Nessuna partita giocata per {selected_player} in questo periodo.")
+            else:
+                total_profit = df_p["Profitto"].sum()
+                total_buyin = df_active["BuyIn"].sum()
+                n_sessions_played = len(df_active)
+                total_club_sessions = len(all_dates)
+                
+                attendance_pct = (n_sessions_played / total_club_sessions * 100) if total_club_sessions > 0 else 0
+                roi = (total_profit / total_buyin * 100) if total_buyin > 0 else 0
+                
+                max_win = df_active["Profitto"].max() if not df_active.empty else 0
+                max_loss = df_active["Profitto"].min() if not df_active.empty else 0
+                
+                wins_df = df_active[df_active["Profitto"] > 0]
+                losses_df = df_active[df_active["Profitto"] < 0]
+                avg_win = wins_df["Profitto"].mean() if not wins_df.empty else 0
+                avg_loss = losses_df["Profitto"].mean() if not losses_df.empty else 0
+                n_wins = len(wins_df)
+                win_rate = (n_wins / n_sessions_played * 100) if n_sessions_played > 0 else 0
+                std_dev = df_active["Profitto"].std()
+                if pd.isna(std_dev): std_dev = 0
+                
+                max_win_streak_count = 0; max_win_streak_money = 0; best_money_streak_val = 0; best_money_streak_count = 0
+                max_loss_streak_count = 0; max_loss_streak_money = 0; worst_money_streak_val = 0; worst_money_streak_count = 0
+                current_streak_type = 0; current_count = 0; current_sum = 0
+                profits_loop = df_active["Profitto"].tolist() + [0] 
+                
+                for val in profits_loop:
+                    tipo_attuale = 1 if val > 0 else (-1 if val < 0 else 0)
+                    if tipo_attuale == 0: 
+                        if current_streak_type == 1:
+                            if current_count > max_win_streak_count: max_win_streak_count = current_count; max_win_streak_money = current_sum
+                            if current_sum > best_money_streak_val: best_money_streak_val = current_sum; best_money_streak_count = current_count
+                        elif current_streak_type == -1:
+                            if current_count > max_loss_streak_count: max_loss_streak_count = current_count; max_loss_streak_money = current_sum
+                            if current_sum < worst_money_streak_val: worst_money_streak_val = current_sum; worst_money_streak_count = current_count
+                        current_streak_type = 0; current_count = 0; current_sum = 0
+                        continue
+                    if tipo_attuale == current_streak_type:
+                        current_count += 1; current_sum += val
+                    else:
+                        if current_streak_type == 1: 
+                            if current_count > max_win_streak_count: max_win_streak_count = current_count; max_win_streak_money = current_sum
+                            if current_sum > best_money_streak_val: best_money_streak_val = current_sum; best_money_streak_count = current_count
+                        elif current_streak_type == -1: 
+                            if current_count > max_loss_streak_count: max_loss_streak_count = current_count; max_loss_streak_money = current_sum
+                            if current_sum < worst_money_streak_val: worst_money_streak_val = current_sum; worst_money_streak_count = current_count
+                        current_streak_type = tipo_attuale; current_count = 1; current_sum = val
+                
+                curr_streak = 0
+                for p in df_active["Profitto"].iloc[::-1]:
+                    if p > 0:
+                        if curr_streak >= 0:
+                            curr_streak += 1
+                        else:
+                            break
+                    elif p < 0:
+                        if curr_streak <= 0:
+                            curr_streak -= 1
+                        else:
+                            break
                     else:
                         break
-                elif p < 0:
-                    if curr_streak <= 0:
-                        curr_streak -= 1
-                    else:
-                        break
-                else:
-                    break
-            
-            streak_icon = "🔥" if curr_streak > 0 else ("❄️" if curr_streak < 0 else "😐")
-            
-            st.markdown(f"### Report: {selected_player} ({filtro_anno})")
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Bilancio", f"€ {total_profit:.2f}", f"{streak_icon} {curr_streak} Streak")
-            k2.metric("ROI %", f"{roi:.1f}%")
-            k3.metric("Presenze", f"{attendance_pct:.0f}%", f"{n_sessions_played} su {total_club_sessions}")
-            k4.metric("Win Rate", f"{win_rate:.0f}%", f"{n_wins}V - {len(losses_df)}P")
-            
-            st.write("")
-            d1, d2, d3, d4 = st.columns(4)
-            d1.metric("Max Vincita", f"€ {max_win:.0f}")
-            d2.metric("Max Perdita", f"€ {max_loss:.0f}")
-            d3.metric("Media Vincita", f"€ {avg_win:.1f}")
-            d4.metric("Media Perdita", f"€ {avg_loss:.1f}")
-            st.caption(f"📊 Volatilità: **€ {std_dev:.1f}**")
-            st.markdown("---")
-            
-            st.subheader("🎢 Analisi Serie (Streak)")
-            c_win, c_loss = st.columns(2)
-            with c_win:
-                st.success("**🟢 RECORD POSITIVI**")
-                st.write("**Tempo:**")
-                st.markdown(f"### {max_win_streak_count} Sess.")
-                st.caption(f"Guadagno: €{max_win_streak_money:.0f}")
-                st.write("---")
-                st.write("**Soldi:**")
-                st.markdown(f"### € {best_money_streak_val:.0f}")
-                st.caption(f"In {best_money_streak_count} Sess.")
-            with c_loss:
-                st.error("**🔴 RECORD NEGATIVI**")
-                st.write("**Tempo:**")
-                st.markdown(f"### {max_loss_streak_count} Sess.")
-                st.caption(f"Persi: €{max_loss_streak_money:.0f}")
-                st.write("---")
-                st.write("**Soldi:**")
-                st.markdown(f"### € {worst_money_streak_val:.0f}")
-                st.caption(f"In {worst_money_streak_count} Sess.")
-            st.markdown("---")
-            
-            st.subheader("📊 Sessioni")
-            df_active_plot = df_active.copy()
-            df_active_plot["Colore"] = df_active_plot["Profitto"].apply(lambda x: "Vinta" if x >= 0 else "Persa")
-            fig_bar = px.bar(df_active_plot, x="Data", y="Profitto", color="Colore", color_discrete_map={"Vinta": "#00CC96", "Persa": "#EF553B"}, text="Profitto")
-            fig_bar.update_traces(texttemplate='%{text:.0f}€', textposition='outside')
-            fig_bar.add_hline(y=0, line_dash="dash", line_color="white")
-            fig_bar.update_layout(showlegend=False, xaxis_title=None, yaxis_title="€")
-            st.plotly_chart(fig_bar, use_container_width=True)
-            
-            st.subheader("📈 Bankroll Dinamico")
-            df_p["CumProfit"] = df_p["Profitto"].cumsum()
-            start_date = df_p["Data"].min() - pd.Timedelta(days=1)
-            row_zero = pd.DataFrame({"Data": [start_date], "CumProfit": [0], "Profitto": [0]})
-            df_chart = pd.concat([row_zero, df_p]).sort_values("Data").reset_index(drop=True)
-            df_chart["pos_fill"] = df_chart["CumProfit"].apply(lambda x: x if x > 0 else 0)
-            df_chart["neg_fill"] = df_chart["CumProfit"].apply(lambda x: x if x < 0 else 0)
-            
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df_chart["Data"], y=df_chart["pos_fill"], fill='tozeroy', fillcolor="rgba(0, 204, 150, 0.2)", mode='none', hoverinfo='skip', showlegend=False))
-            fig.add_trace(go.Scatter(x=df_chart["Data"], y=df_chart["neg_fill"], fill='tozeroy', fillcolor="rgba(239, 85, 59, 0.2)", mode='none', hoverinfo='skip', showlegend=False))
-            
-            green_x, green_y = [], []
-            red_x, red_y = [], []
-            blue_x, blue_y = [], []
-            for i in range(1, len(df_chart)):
-                x0, y0 = df_chart["Data"].iloc[i-1], df_chart["CumProfit"].iloc[i-1]
-                x1, y1 = df_chart["Data"].iloc[i], df_chart["CumProfit"].iloc[i]
-                diff = df_chart["Profitto"].iloc[i] 
-                if diff > 0: green_x.extend([x0, x1, None]); green_y.extend([y0, y1, None])
-                elif diff < 0: red_x.extend([x0, x1, None]); red_y.extend([y0, y1, None])
-                else: blue_x.extend([x0, x1, None]); blue_y.extend([y0, y1, None])
-            
-            width_line = 3
-            fig.add_trace(go.Scatter(x=green_x, y=green_y, mode='lines+markers', line=dict(color="#00CC96", width=width_line), marker=dict(size=4), name="Vittoria"))
-            fig.add_trace(go.Scatter(x=red_x, y=red_y, mode='lines+markers', line=dict(color="#EF553B", width=width_line), marker=dict(size=4), name="Sconfitta"))
-            fig.add_trace(go.Scatter(x=blue_x, y=blue_y, mode='lines+markers', line=dict(color="#636EFA", width=width_line, dash='dot'), marker=dict(size=4), name="Assente/Pari"))
-            fig.update_layout(xaxis_title=None, yaxis_title="€ Totali", showlegend=False, hovermode="x unified")
-            st.plotly_chart(fig, use_container_width=True)
+                
+                streak_icon = "🔥" if curr_streak > 0 else ("❄️" if curr_streak < 0 else "😐")
+                
+                st.markdown(f"### Report: {selected_player} ({filtro_anno})")
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Bilancio", f"€ {total_profit:.2f}", f"{streak_icon} {curr_streak} Streak")
+                k2.metric("ROI %", f"{roi:.1f}%")
+                k3.metric("Presenze", f"{attendance_pct:.0f}%", f"{n_sessions_played} su {total_club_sessions}")
+                k4.metric("Win Rate", f"{win_rate:.0f}%", f"{n_wins}V - {len(losses_df)}P")
+                
+                st.write("")
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("Max Vincita", f"€ {max_win:.0f}")
+                d2.metric("Max Perdita", f"€ {max_loss:.0f}")
+                d3.metric("Media Vincita", f"€ {avg_win:.1f}")
+                d4.metric("Media Perdita", f"€ {avg_loss:.1f}")
+                st.caption(f"📊 Volatilità: **€ {std_dev:.1f}**")
+                st.markdown("---")
+                
+                st.subheader("🎢 Analisi Serie (Streak)")
+                c_win, c_loss = st.columns(2)
+                with c_win:
+                    st.success("**🟢 RECORD POSITIVI**")
+                    st.write("**Tempo:**")
+                    st.markdown(f"### {max_win_streak_count} Sess.")
+                    st.caption(f"Guadagno: €{max_win_streak_money:.0f}")
+                    st.write("---")
+                    st.write("**Soldi:**")
+                    st.markdown(f"### € {best_money_streak_val:.0f}")
+                    st.caption(f"In {best_money_streak_count} Sess.")
+                with c_loss:
+                    st.error("**🔴 RECORD NEGATIVI**")
+                    st.write("**Tempo:**")
+                    st.markdown(f"### {max_loss_streak_count} Sess.")
+                    st.caption(f"Persi: €{max_loss_streak_money:.0f}")
+                    st.write("---")
+                    st.write("**Soldi:**")
+                    st.markdown(f"### € {worst_money_streak_val:.0f}")
+                    st.caption(f"In {worst_money_streak_count} Sess.")
+                st.markdown("---")
+                
+                st.subheader("📊 Sessioni")
+                df_active_plot = df_active.copy()
+                df_active_plot["Colore"] = df_active_plot["Profitto"].apply(lambda x: "Vinta" if x >= 0 else "Persa")
+                fig_bar = px.bar(df_active_plot, x="Data", y="Profitto", color="Colore", color_discrete_map={"Vinta": "#00CC96", "Persa": "#EF553B"}, text="Profitto")
+                fig_bar.update_traces(texttemplate='%{text:.0f}€', textposition='outside')
+                fig_bar.add_hline(y=0, line_dash="dash", line_color="white")
+                fig_bar.update_layout(showlegend=False, xaxis_title=None, yaxis_title="€")
+                st.plotly_chart(fig_bar, use_container_width=True)
+                
+                st.subheader("📈 Bankroll Dinamico")
+                df_p["CumProfit"] = df_p["Profitto"].cumsum()
+                start_date = df_p["Data"].min() - pd.Timedelta(days=1)
+                row_zero = pd.DataFrame({"Data": [start_date], "CumProfit": [0], "Profitto": [0]})
+                df_chart = pd.concat([row_zero, df_p]).sort_values("Data").reset_index(drop=True)
+                df_chart["pos_fill"] = df_chart["CumProfit"].apply(lambda x: x if x > 0 else 0)
+                df_chart["neg_fill"] = df_chart["CumProfit"].apply(lambda x: x if x < 0 else 0)
+                
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=df_chart["Data"], y=df_chart["pos_fill"], fill='tozeroy', fillcolor="rgba(0, 204, 150, 0.2)", mode='none', hoverinfo='skip', showlegend=False))
+                fig.add_trace(go.Scatter(x=df_chart["Data"], y=df_chart["neg_fill"], fill='tozeroy', fillcolor="rgba(239, 85, 59, 0.2)", mode='none', hoverinfo='skip', showlegend=False))
+                
+                green_x, green_y = [], []
+                red_x, red_y = [], []
+                blue_x, blue_y = [], []
+                for i in range(1, len(df_chart)):
+                    x0, y0 = df_chart["Data"].iloc[i-1], df_chart["CumProfit"].iloc[i-1]
+                    x1, y1 = df_chart["Data"].iloc[i], df_chart["CumProfit"].iloc[i]
+                    diff = df_chart["Profitto"].iloc[i] 
+                    if diff > 0: green_x.extend([x0, x1, None]); green_y.extend([y0, y1, None])
+                    elif diff < 0: red_x.extend([x0, x1, None]); red_y.extend([y0, y1, None])
+                    else: blue_x.extend([x0, x1, None]); blue_y.extend([y0, y1, None])
+                
+                width_line = 3
+                fig.add_trace(go.Scatter(x=green_x, y=green_y, mode='lines+markers', line=dict(color="#00CC96", width=width_line), marker=dict(size=4), name="Vittoria"))
+                fig.add_trace(go.Scatter(x=red_x, y=red_y, mode='lines+markers', line=dict(color="#EF553B", width=width_line), marker=dict(size=4), name="Sconfitta"))
+                fig.add_trace(go.Scatter(x=blue_x, y=blue_y, mode='lines+markers', line=dict(color="#636EFA", width=width_line, dash='dot'), marker=dict(size=4), name="Assente/Pari"))
+                fig.update_layout(xaxis_title=None, yaxis_title="€ Totali", showlegend=False, hovermode="x unified")
+                st.plotly_chart(fig, use_container_width=True)
             
     with tab_club:
         st.caption(f"Analisi periodo: **{filtro_anno}**")
@@ -487,17 +505,14 @@ def importa_dati(club_name):
     
     if uploaded_file:
         try:
-            # Caricamento file
             if uploaded_file.name.endswith('.csv'): 
                 df_new = pd.read_csv(uploaded_file)
             else: 
                 df_new = pd.read_excel(uploaded_file)
             
-            # 1. Normalizzazione Nomi Colonne (Rimuove spazi e mette minuscolo per il controllo)
-            df_new.columns = [c.strip() for c in df_new.columns] # Via spazi extra
+            df_new.columns = [c.strip() for c in df_new.columns]
             cols_lower = {c.lower(): c for c in df_new.columns}
             
-            # Mappa per rinominare correttamente
             rename_map = {}
             if "nome del giocatore" in cols_lower: rename_map[cols_lower["nome del giocatore"]] = "Giocatore"
             elif "giocatore" in cols_lower: rename_map[cols_lower["giocatore"]] = "Giocatore"
@@ -505,7 +520,6 @@ def importa_dati(club_name):
             if "entrata" in cols_lower: rename_map[cols_lower["entrata"]] = "BuyIn"
             elif "buyin" in cols_lower: rename_map[cols_lower["buyin"]] = "BuyIn"
             
-            # Gestione varianti "Uscita" o "Uscita (€)"
             for col in cols_lower:
                 if "uscita" in col or "cashout" in col:
                     rename_map[cols_lower[col]] = "CashOut"
@@ -513,34 +527,24 @@ def importa_dati(club_name):
             
             if "data" in cols_lower: rename_map[cols_lower["data"]] = "Data"
             
-            # Applichiamo la rinomina
             df_new = df_new.rename(columns=rename_map)
             
-            # Controllo esistenza colonne necessarie
             required = ["Data", "Giocatore", "BuyIn", "CashOut"]
             if not all(col in df_new.columns for col in required):
                 st.error(f"Mancano delle colonne o i nomi sono errati. Colonne trovate: {list(df_new.columns)}")
                 st.write("Rinominale nel file Excel in: Data, Giocatore, BuyIn, CashOut")
             else:
-                # 2. Pulizia Numeri (Gestione trattini '-' e simbolo '€')
                 for col in ["BuyIn", "CashOut"]:
-                    # Converte in stringa, rimuove €, sostituisce , con . e - con 0
                     df_new[col] = df_new[col].astype(str).str.replace('€', '', regex=False)
                     df_new[col] = df_new[col].str.replace(',', '.', regex=False)
                     df_new[col] = df_new[col].str.replace('-', '0', regex=False)
-                    df_new[col] = df_new[col].str.strip() # Via spazi vuoti
-                    # Converte in numeri (i valori vuoti diventano 0)
+                    df_new[col] = df_new[col].str.strip()
                     df_new[col] = pd.to_numeric(df_new[col], errors='coerce').fillna(0)
 
-                # 3. Calcolo Profitto
                 if "Profitto" not in df_new.columns: 
                     df_new["Profitto"] = df_new["CashOut"] - df_new["BuyIn"]
                 
-                # 4. Gestione Date (Formato Italiano giorno/mese/anno)
-                # dayfirst=True è fondamentale per le date italiane (es. 03/01/2025 è 3 Gennaio, non 1 Marzo)
                 df_new["Data"] = pd.to_datetime(df_new["Data"], dayfirst=True, errors='coerce')
-                
-                # Rimuove righe con date non valide
                 df_new = df_new.dropna(subset=["Data"])
 
                 st.write("Anteprima dati puliti:")
@@ -553,7 +557,7 @@ def importa_dati(club_name):
                     
         except Exception as e:
             st.error(f"Errore durante l'importazione: {e}")
-            
+
 def dashboard_club(club_name):
     owner = get_club_owner(club_name)
     is_host = (st.session_state.username == owner)
@@ -569,7 +573,7 @@ def dashboard_club(club_name):
     if menu == "Partita in Corso": 
         gestisci_partita_live(club_name, is_host)
     elif menu == "Statistiche": 
-        mostra_statistiche(club_name)
+        mostra_statistiche(club_name, is_host)
     elif menu == "Storico & Modifica": 
         gestisci_storico(club_name, is_host)
     elif menu == "Membri":
