@@ -1,85 +1,246 @@
 import streamlit as st
 import pandas as pd
-import os
-import json
-import hashlib
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 from datetime import date
+import hashlib
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots 
+import time
 
 # --- CONFIGURAZIONE ---
 st.set_page_config(page_title="Poker Club", page_icon="♣️", layout="centered")
 
-# FILE DATI
-USER_DB_FILE = "users.json"
-CLUBS_DB_FILE = "clubs.json"
-GAMES_DB_FILE = "games_log.csv"
+# COSTANTI
+SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+CREDENTIALS_FILE = "credentials.json"
+SHEET_NAME = "PokerDB"
 
-# --- BACKEND ---
+# --- CONNESSIONE GOOGLE SHEETS (Con Cache Risorse) ---
+@st.cache_resource
+def get_connection():
+    try:
+        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, SCOPE)
+        client = gspread.authorize(creds)
+        sheet = client.open(SHEET_NAME)
+        return sheet
+    except Exception as e:
+        st.error(f"Errore connessione Google Sheets: {e}")
+        st.stop()
+
+# --- INIT DB ---
+@st.cache_resource
+def init_db():
+    try:
+        sheet = get_connection()
+        ws_users = sheet.worksheet("Utenti")
+        if not ws_users.row_values(1): ws_users.append_row(["Username", "Password"])
+        ws_clubs = sheet.worksheet("Club")
+        if not ws_clubs.row_values(1): ws_clubs.append_row(["NomeClub", "Owner", "Membri"])
+        ws_games = sheet.worksheet("Partite")
+        if not ws_games.row_values(1): ws_games.append_row(["Data", "Giocatore", "BuyIn", "CashOut", "Profitto", "Club"])
+    except Exception as e:
+        time.sleep(1)
+
+# --- BACKEND CACHED ---
 def hash_password(password):
     return hashlib.sha256(str.encode(password)).hexdigest()
 
-def carica_json(filename):
-    if not os.path.exists(filename): return {}
-    with open(filename, "r") as f: return json.load(f)
-
-def salva_json(filename, data):
-    with open(filename, "w") as f: json.dump(data, f)
+@st.cache_data(ttl=600)
+def carica_utenti():
+    sheet = get_connection()
+    ws = sheet.worksheet("Utenti")
+    records = ws.get_all_records()
+    users_dict = {}
+    for r in records:
+        users_dict[str(r["Username"])] = {"password": str(r["Password"])}
+    return users_dict
 
 def crea_utente(username, password):
-    users = carica_json(USER_DB_FILE)
+    users = carica_utenti()
     if username in users: return False
-    users[username] = {"password": hash_password(password)}
-    salva_json(USER_DB_FILE, users)
+    sheet = get_connection()
+    ws = sheet.worksheet("Utenti")
+    ws.append_row([username, hash_password(password)])
+    st.cache_data.clear()
     return True
 
 def verifica_login(username, password):
-    users = carica_json(USER_DB_FILE)
+    users = carica_utenti()
     if username in users and users[username]["password"] == hash_password(password):
         return True
     return False
 
+@st.cache_data(ttl=60)
+def carica_clubs():
+    sheet = get_connection()
+    ws = sheet.worksheet("Club")
+    records = ws.get_all_records()
+    clubs_dict = {}
+    for r in records:
+        members_list = str(r["Membri"]).split(",") if r["Membri"] else []
+        clubs_dict[str(r["NomeClub"])] = {"owner": str(r["Owner"]), "members": members_list}
+    return clubs_dict
+
 def crea_club(nome_club, owner):
-    clubs = carica_json(CLUBS_DB_FILE)
+    st.cache_data.clear() 
+    clubs = carica_clubs()
     if nome_club in clubs: return False
-    clubs[nome_club] = {"owner": owner, "members": [owner], "active_session": False}
-    salva_json(CLUBS_DB_FILE, clubs)
+    sheet = get_connection()
+    ws = sheet.worksheet("Club")
+    ws.append_row([nome_club, owner, owner]) 
+    st.cache_data.clear()
     return True
 
 def get_user_clubs(username):
-    all_clubs = carica_json(CLUBS_DB_FILE)
+    all_clubs = carica_clubs()
     return [name for name, data in all_clubs.items() if username in data["members"]]
 
+def get_club_owner(club_name):
+    clubs = carica_clubs()
+    return clubs[club_name]["owner"] if club_name in clubs else None
+
 def aggiungi_membro_al_club(club_name, new_member_username):
-    users = carica_json(USER_DB_FILE)
-    clubs = carica_json(CLUBS_DB_FILE)
+    users = carica_utenti()
     if new_member_username not in users: return "not_found"
-    if new_member_username in clubs[club_name]["members"]: return "already_in"
-    clubs[club_name]["members"].append(new_member_username)
-    salva_json(CLUBS_DB_FILE, clubs)
+    sheet = get_connection()
+    ws = sheet.worksheet("Club")
+    cell = ws.find(club_name)
+    if not cell: return "error"
+    row_idx = cell.row
+    current_members_str = ws.cell(row_idx, 3).value 
+    current_members = current_members_str.split(",") if current_members_str else []
+    if new_member_username in current_members: return "already_in"
+    current_members.append(new_member_username)
+    new_members_str = ",".join(current_members)
+    ws.update_cell(row_idx, 3, new_members_str)
+    st.cache_data.clear()
     return "success"
 
-def salva_partita(club_name, dati_sessione_df):
-    if not os.path.exists(GAMES_DB_FILE):
-        df_tot = pd.DataFrame(columns=["Club", "Data", "Giocatore", "BuyIn", "CashOut", "Profitto"])
-    else:
-        df_tot = pd.read_csv(GAMES_DB_FILE)
-    dati_sessione_df["Club"] = club_name
-    dati_sessione_df = dati_sessione_df[["Data", "Giocatore", "BuyIn", "CashOut", "Profitto", "Club"]]
-    df_final = pd.concat([df_tot, dati_sessione_df], ignore_index=True)
-    df_final.to_csv(GAMES_DB_FILE, index=False)
-
+@st.cache_data(ttl=60)
 def carica_dati_club(club_name):
-    if not os.path.exists(GAMES_DB_FILE): return pd.DataFrame()
-    df = pd.read_csv(GAMES_DB_FILE)
-    return df[df["Club"] == club_name].copy()
+    sheet = get_connection()
+    ws = sheet.worksheet("Partite")
+    data = ws.get_all_records()
+    df = pd.DataFrame(data)
+    if df.empty: return pd.DataFrame()
+    if "Club" in df.columns:
+        df = df[df["Club"] == club_name].copy()
+    return df
 
-def get_club_owner(club_name):
-    clubs = carica_json(CLUBS_DB_FILE)
-    if club_name in clubs:
-        return clubs[club_name]["owner"]
-    return None
+def salva_partita(club_name, dati_sessione_df):
+    sheet = get_connection()
+    ws = sheet.worksheet("Partite")
+    rows_to_add = []
+    for index, row in dati_sessione_df.iterrows():
+        r = [str(row["Data"]), row["Giocatore"], float(row["BuyIn"]), float(row["CashOut"]), float(row["Profitto"]), club_name]
+        rows_to_add.append(r)
+    if rows_to_add:
+        ws.append_rows(rows_to_add)
+        st.cache_data.clear()
+
+# --- IMPORTAZIONE MODIFICATA (Strategia Mista) ---
+def importa_dati(club_name):
+    st.header("📥 Importa da Excel")
+    st.write("Carica qui il tuo file storico.")
+    
+    uploaded_file = st.file_uploader("Trascina qui il file (.xlsx o .csv)", type=["xlsx", "csv"])
+    
+    if uploaded_file:
+        try:
+            # 1. NON usiamo dtype=str per tutto. Lasciamo che Pandas capisca le date da solo.
+            if uploaded_file.name.endswith('.csv'): 
+                df_new = pd.read_csv(uploaded_file)
+            else: 
+                df_new = pd.read_excel(uploaded_file)
+            
+            # Pulizia nomi colonne
+            df_new.columns = [c.strip() for c in df_new.columns]
+            cols_lower = {c.lower(): c for c in df_new.columns}
+            
+            rename_map = {}
+            if "nome del giocatore" in cols_lower: rename_map[cols_lower["nome del giocatore"]] = "Giocatore"
+            elif "giocatore" in cols_lower: rename_map[cols_lower["giocatore"]] = "Giocatore"
+            if "entrata" in cols_lower: rename_map[cols_lower["entrata"]] = "BuyIn"
+            elif "buyin" in cols_lower: rename_map[cols_lower["buyin"]] = "BuyIn"
+            for col in cols_lower:
+                if "uscita" in col or "cashout" in col:
+                    rename_map[cols_lower[col]] = "CashOut"
+                    break
+            if "data" in cols_lower: rename_map[cols_lower["data"]] = "Data"
+            
+            df_new = df_new.rename(columns=rename_map)
+            
+            # 2. PULIZIA NUMERI (Convertiamo a stringa SOLO ORA per pulire)
+            def clean_number_italy(x):
+                # Forziamo a stringa per analizzare virgole e punti
+                s = str(x).strip()
+                if s == "nan" or s == "": return 0.0
+                
+                s = s.replace("€", "").strip()
+                s = s.replace("-", "0")
+                
+                # Se c'è la virgola, è un decimale italiano (17,50)
+                if "," in s:
+                    s = s.replace(".", "") # Via i punti delle migliaia
+                    s = s.replace(",", ".") # Virgola diventa punto
+                return float(s)
+
+            for col in ["BuyIn", "CashOut"]:
+                df_new[col] = df_new[col].apply(clean_number_italy)
+
+            df_new["Profitto"] = df_new["CashOut"] - df_new["BuyIn"]
+            
+            # 3. DATE (Lasciamo che Pandas faccia la magia, poi forziamo il formato)
+            # errors='coerce' metterà NaT se proprio non capisce, ma senza dtype=str dovrebbe capire quasi tutto
+            df_new["Data"] = pd.to_datetime(df_new["Data"], dayfirst=True, errors='coerce')
+            
+            # Check righe perse
+            righe_totali = len(df_new)
+            df_new = df_new.dropna(subset=["Data"])
+            righe_valide = len(df_new)
+            
+            if righe_valide < righe_totali:
+                st.warning(f"⚠️ Attenzione: {righe_totali - righe_valide} righe ignorate per data non valida.")
+            
+            # Convertiamo in stringa YYYY-MM-DD per Google Sheets
+            df_new["Data"] = df_new["Data"].dt.strftime('%Y-%m-%d')
+
+            st.write(f"Anteprima ({righe_valide} righe pronte):")
+            st.dataframe(df_new.head())
+            
+            if st.button("✅ Conferma Importazione"):
+                sheet = get_connection()
+                ws = sheet.worksheet("Partite")
+                
+                all_rows = []
+                for index, row in df_new.iterrows():
+                    r = [str(row["Data"]), row["Giocatore"], float(row["BuyIn"]), float(row["CashOut"]), float(row["Profitto"]), club_name]
+                    all_rows.append(r)
+                
+                # CARICAMENTO A BLOCCHI
+                chunk_size = 50
+                progress_bar = st.progress(0)
+                total_rows = len(all_rows)
+                status_text = st.empty()
+                
+                for i in range(0, total_rows, chunk_size):
+                    chunk = all_rows[i:i + chunk_size]
+                    ws.append_rows(chunk)
+                    progress = min((i + chunk_size) / total_rows, 1.0)
+                    progress_bar.progress(progress)
+                    status_text.text(f"Caricamento: {int(progress*100)}%...")
+                    time.sleep(1.5)
+                
+                status_text.text("✅ Fatto!")
+                st.success(f"Caricate {total_rows} righe con successo!")
+                st.cache_data.clear()
+                time.sleep(1)
+                st.rerun()
+                    
+        except Exception as e:
+            st.error(f"Errore: {e}")
 
 # --- FRONTEND ---
 if "logged_in" not in st.session_state: st.session_state.logged_in = False
@@ -87,8 +248,13 @@ if "username" not in st.session_state: st.session_state.username = None
 if "current_club" not in st.session_state: st.session_state.current_club = None
 if "session_data" not in st.session_state: st.session_state.session_data = []
 
+try:
+    init_db()
+except:
+    pass
+
 def login_page():
-    st.title("♣️ Poker Hub")
+    st.title("♣️ Poker Hub (Cloud Edition)")
     tab1, tab2 = st.tabs(["Accedi", "Registrati"])
     with tab1:
         u = st.text_input("Username", key="log_u")
@@ -107,15 +273,14 @@ def login_page():
 def gestisci_partita_live(club_name, is_host):
     st.subheader("🎲 Tavolo da Gioco")
     if not is_host:
-        st.info("🔒 Solo l'Host può inserire i dati della partita. Tu puoi goderti lo spettacolo!")
-        st.caption("Ricarica la pagina per vedere gli aggiornamenti quando l'Host salva.")
+        st.info("🔒 Solo l'Host può inserire i dati.")
         return
 
     df_session = pd.DataFrame(st.session_state.session_data)
     if df_session.empty:
         df_session = pd.DataFrame(columns=["Data", "Giocatore", "BuyIn", "CashOut", "Profitto"])
 
-    clubs = carica_json(CLUBS_DB_FILE)
+    clubs = carica_clubs()
     membri = clubs[club_name]["members"]
 
     with st.expander("Aggiungi Risultato", expanded=True):
@@ -142,11 +307,11 @@ def gestisci_partita_live(club_name, is_host):
         if tot_profit != 0: st.warning(f"⚠️ Discrepanza: {tot_profit}€")
         else: st.success("✅ Conti perfetti.")
         
-        if st.button("💾 SALVA SESSIONE NEL DATABASE", type="primary"):
+        if st.button("💾 SALVA SESSIONE SU GOOGLE SHEETS", type="primary"):
             salva_partita(club_name, df_session)
             st.session_state.session_data = []
             st.balloons()
-            st.success("Salvato!")
+            st.success("Salvato nel Cloud!")
             st.rerun()
 
 def mostra_statistiche(club_name, is_host):
@@ -154,9 +319,14 @@ def mostra_statistiche(club_name, is_host):
     if df.empty:
         st.info("Nessuna partita registrata in questo club.")
         return
-    df["Data"] = pd.to_datetime(df["Data"])
-    st.header("📊 Centro Analisi")
     
+    df["Data"] = pd.to_datetime(df["Data"], errors='coerce')
+    df["BuyIn"] = pd.to_numeric(df["BuyIn"], errors='coerce').fillna(0)
+    df["CashOut"] = pd.to_numeric(df["CashOut"], errors='coerce').fillna(0)
+    df["Profitto"] = pd.to_numeric(df["Profitto"], errors='coerce').fillna(0)
+    df = df.dropna(subset=["Data"])
+
+    st.header("📊 Centro Analisi")
     col_filter_1, col_filter_2 = st.columns(2)
     with col_filter_1:
         anni_disponibili = sorted(df["Data"].dt.year.unique(), reverse=True)
@@ -179,33 +349,19 @@ def mostra_statistiche(club_name, is_host):
         return
     
     tab_pers, tab_club = st.tabs(["👤 Statistiche Personali", "🏆 Statistiche Globali Club"])
-    
     with tab_pers:
-        # --- LOGICA PERMESSI ---
-        # Se è HOST: vede tutti
-        # Se è MEMBER: vede solo se stesso
         tutti_giocatori = sorted(df["Giocatore"].unique())
-        
         if is_host:
             options = tutti_giocatori
-            # Cerca di selezionare l'host di default se presente
             default_idx = 0
-            if st.session_state.username in options:
-                default_idx = options.index(st.session_state.username)
+            if st.session_state.username in options: default_idx = options.index(st.session_state.username)
         else:
-            # Filtra solo se stesso
-            if st.session_state.username in tutti_giocatori:
-                options = [st.session_state.username]
-                default_idx = 0
-            else:
-                options = []
-        
+            options = [st.session_state.username] if st.session_state.username in tutti_giocatori else []
+            default_idx = 0
         if not options:
-            st.warning("Non hai ancora giocato nessuna partita, quindi non ci sono statistiche personali da mostrare.")
+            st.warning("Nessuna statistica disponibile.")
         else:
             selected_player = st.selectbox("Analizza Giocatore:", options, index=default_idx)
-            
-            # Da qui in poi il codice è identico, usa selected_player
             all_dates = sorted(df_filtered["Data"].unique())
             full_timeline = pd.DataFrame({"Data": all_dates})
             player_data = df_filtered[df_filtered["Giocatore"] == selected_player].copy()
@@ -217,19 +373,16 @@ def mostra_statistiche(club_name, is_host):
             df_active = df_p[df_p["BuyIn"] > 0].copy() 
             
             if df_active.empty and df_p["Profitto"].sum() == 0:
-                st.warning(f"Nessuna partita giocata per {selected_player} in questo periodo.")
+                st.warning(f"Nessuna partita giocata per {selected_player}.")
             else:
                 total_profit = df_p["Profitto"].sum()
                 total_buyin = df_active["BuyIn"].sum()
                 n_sessions_played = len(df_active)
                 total_club_sessions = len(all_dates)
-                
                 attendance_pct = (n_sessions_played / total_club_sessions * 100) if total_club_sessions > 0 else 0
                 roi = (total_profit / total_buyin * 100) if total_buyin > 0 else 0
-                
                 max_win = df_active["Profitto"].max() if not df_active.empty else 0
                 max_loss = df_active["Profitto"].min() if not df_active.empty else 0
-                
                 wins_df = df_active[df_active["Profitto"] > 0]
                 losses_df = df_active[df_active["Profitto"] < 0]
                 avg_win = wins_df["Profitto"].mean() if not wins_df.empty else 0
@@ -239,11 +392,11 @@ def mostra_statistiche(club_name, is_host):
                 std_dev = df_active["Profitto"].std()
                 if pd.isna(std_dev): std_dev = 0
                 
+                # Streak Calc
                 max_win_streak_count = 0; max_win_streak_money = 0; best_money_streak_val = 0; best_money_streak_count = 0
                 max_loss_streak_count = 0; max_loss_streak_money = 0; worst_money_streak_val = 0; worst_money_streak_count = 0
                 current_streak_type = 0; current_count = 0; current_sum = 0
                 profits_loop = df_active["Profitto"].tolist() + [0] 
-                
                 for val in profits_loop:
                     tipo_attuale = 1 if val > 0 else (-1 if val < 0 else 0)
                     if tipo_attuale == 0: 
@@ -269,17 +422,12 @@ def mostra_statistiche(club_name, is_host):
                 curr_streak = 0
                 for p in df_active["Profitto"].iloc[::-1]:
                     if p > 0:
-                        if curr_streak >= 0:
-                            curr_streak += 1
-                        else:
-                            break
+                        if curr_streak >= 0: curr_streak += 1
+                        else: break
                     elif p < 0:
-                        if curr_streak <= 0:
-                            curr_streak -= 1
-                        else:
-                            break
-                    else:
-                        break
+                        if curr_streak <= 0: curr_streak -= 1
+                        else: break
+                    else: break
                 
                 streak_icon = "🔥" if curr_streak > 0 else ("❄️" if curr_streak < 0 else "😐")
                 
@@ -303,22 +451,12 @@ def mostra_statistiche(club_name, is_host):
                 c_win, c_loss = st.columns(2)
                 with c_win:
                     st.success("**🟢 RECORD POSITIVI**")
-                    st.write("**Tempo:**")
-                    st.markdown(f"### {max_win_streak_count} Sess.")
-                    st.caption(f"Guadagno: €{max_win_streak_money:.0f}")
-                    st.write("---")
-                    st.write("**Soldi:**")
-                    st.markdown(f"### € {best_money_streak_val:.0f}")
-                    st.caption(f"In {best_money_streak_count} Sess.")
+                    st.write("**Tempo:**"); st.markdown(f"### {max_win_streak_count} Sess."); st.caption(f"Guadagno: €{max_win_streak_money:.0f}")
+                    st.write("---"); st.write("**Soldi:**"); st.markdown(f"### € {best_money_streak_val:.0f}"); st.caption(f"In {best_money_streak_count} Sess.")
                 with c_loss:
                     st.error("**🔴 RECORD NEGATIVI**")
-                    st.write("**Tempo:**")
-                    st.markdown(f"### {max_loss_streak_count} Sess.")
-                    st.caption(f"Persi: €{max_loss_streak_money:.0f}")
-                    st.write("---")
-                    st.write("**Soldi:**")
-                    st.markdown(f"### € {worst_money_streak_val:.0f}")
-                    st.caption(f"In {worst_money_streak_count} Sess.")
+                    st.write("**Tempo:**"); st.markdown(f"### {max_loss_streak_count} Sess."); st.caption(f"Persi: €{max_loss_streak_money:.0f}")
+                    st.write("---"); st.write("**Soldi:**"); st.markdown(f"### € {worst_money_streak_val:.0f}"); st.caption(f"In {worst_money_streak_count} Sess.")
                 st.markdown("---")
                 
                 st.subheader("📊 Sessioni")
@@ -341,10 +479,7 @@ def mostra_statistiche(club_name, is_host):
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=df_chart["Data"], y=df_chart["pos_fill"], fill='tozeroy', fillcolor="rgba(0, 204, 150, 0.2)", mode='none', hoverinfo='skip', showlegend=False))
                 fig.add_trace(go.Scatter(x=df_chart["Data"], y=df_chart["neg_fill"], fill='tozeroy', fillcolor="rgba(239, 85, 59, 0.2)", mode='none', hoverinfo='skip', showlegend=False))
-                
-                green_x, green_y = [], []
-                red_x, red_y = [], []
-                blue_x, blue_y = [], []
+                green_x, green_y = [], []; red_x, red_y = [], []; blue_x, blue_y = [], []
                 for i in range(1, len(df_chart)):
                     x0, y0 = df_chart["Data"].iloc[i-1], df_chart["CumProfit"].iloc[i-1]
                     x1, y1 = df_chart["Data"].iloc[i], df_chart["CumProfit"].iloc[i]
@@ -352,14 +487,13 @@ def mostra_statistiche(club_name, is_host):
                     if diff > 0: green_x.extend([x0, x1, None]); green_y.extend([y0, y1, None])
                     elif diff < 0: red_x.extend([x0, x1, None]); red_y.extend([y0, y1, None])
                     else: blue_x.extend([x0, x1, None]); blue_y.extend([y0, y1, None])
-                
                 width_line = 3
                 fig.add_trace(go.Scatter(x=green_x, y=green_y, mode='lines+markers', line=dict(color="#00CC96", width=width_line), marker=dict(size=4), name="Vittoria"))
                 fig.add_trace(go.Scatter(x=red_x, y=red_y, mode='lines+markers', line=dict(color="#EF553B", width=width_line), marker=dict(size=4), name="Sconfitta"))
                 fig.add_trace(go.Scatter(x=blue_x, y=blue_y, mode='lines+markers', line=dict(color="#636EFA", width=width_line, dash='dot'), marker=dict(size=4), name="Assente/Pari"))
                 fig.update_layout(xaxis_title=None, yaxis_title="€ Totali", showlegend=False, hovermode="x unified")
                 st.plotly_chart(fig, use_container_width=True)
-            
+
     with tab_club:
         st.caption(f"Analisi periodo: **{filtro_anno}**")
         num_sessions = len(df_filtered["Data"].unique())
@@ -367,33 +501,25 @@ def mostra_statistiche(club_name, is_host):
         
         player_profits = df_filtered.groupby("Giocatore")["Profitto"].sum()
         if not player_profits.empty:
-            shark_name = player_profits.idxmax()
-            shark_val = player_profits.max()
+            shark_name = player_profits.idxmax(); shark_val = player_profits.max()
         else:
-            shark_name = "-"
-            shark_val = 0
+            shark_name = "-"; shark_val = 0
             
         if not df_filtered.empty:
-            sniper_idx = df_filtered["Profitto"].idxmax()
-            sniper_name = df_filtered.loc[sniper_idx, "Giocatore"]
-            sniper_val = df_filtered.loc[sniper_idx, "Profitto"]
+            sniper_idx = df_filtered["Profitto"].idxmax(); sniper_name = df_filtered.loc[sniper_idx, "Giocatore"]; sniper_val = df_filtered.loc[sniper_idx, "Profitto"]
         else:
-            sniper_name = "-"
-            sniper_val = 0
+            sniper_name = "-"; sniper_val = 0
             
         all_players = sorted(df_filtered["Giocatore"].unique())
         with st.expander("⚙️ Opzioni calcolo presenze (Escludi Host)"):
             excluded_players = st.multiselect("Escludi giocatori dal premio 'Stakanovista'", all_players, default=[])
-            
         attendance_counts = df_filtered.groupby("Giocatore")["Data"].nunique()
         attendance_counts_clean = attendance_counts.drop(excluded_players, errors='ignore')
         if not attendance_counts_clean.empty:
-            stak_name = attendance_counts_clean.idxmax()
-            stak_val = attendance_counts_clean.max()
+            stak_name = attendance_counts_clean.idxmax(); stak_val = attendance_counts_clean.max()
         else:
-            stak_name = "N/A"
-            stak_val = 0
-            
+            stak_name = "N/A"; stak_val = 0
+        
         avg_money_per_session = total_buyin_all / num_sessions if num_sessions > 0 else 0
         avg_players_per_session = len(df_filtered) / num_sessions if num_sessions > 0 else 0
         
@@ -414,35 +540,23 @@ def mostra_statistiche(club_name, is_host):
         st.subheader("⚔️ Il Trono (Storia del Record)")
         df_pivot = df_filtered.pivot_table(index="Data", columns="Giocatore", values="Profitto", aggfunc="sum").fillna(0)
         df_cumsum = df_pivot.cumsum()
-        
         if not df_cumsum.empty:
-            leader_series = df_cumsum.idxmax(axis=1)
-            max_val_series = df_cumsum.max(axis=1)   
+            leader_series = df_cumsum.idxmax(axis=1); max_val_series = df_cumsum.max(axis=1)   
             df_race = pd.DataFrame({"Leader": leader_series, "Profitto": max_val_series}).reset_index().sort_values("Data")
             start_date_all = df_race["Data"].min() - pd.Timedelta(days=1)
             first_leader = df_race.iloc[0]["Leader"] if not df_race.empty else "N/A"
             row_zero = pd.DataFrame({"Data": [start_date_all], "Leader": [first_leader], "Profitto": [0]})
             df_race = pd.concat([row_zero, df_race]).sort_values("Data")
-            
             fig_race = go.Figure()
-            unique_leaders = df_race["Leader"].unique()
-            colors = px.colors.qualitative.Plotly 
+            unique_leaders = df_race["Leader"].unique(); colors = px.colors.qualitative.Plotly 
             color_map = {player: colors[i % len(colors)] for i, player in enumerate(unique_leaders)}
-            
             for i in range(1, len(df_race)):
-                x0, y0 = df_race["Data"].iloc[i-1], df_race["Profitto"].iloc[i-1]
-                x1, y1 = df_race["Data"].iloc[i], df_race["Profitto"].iloc[i]
-                current_leader = df_race["Leader"].iloc[i] 
+                x0, y0 = df_race["Data"].iloc[i-1], df_race["Profitto"].iloc[i-1]; x1, y1 = df_race["Data"].iloc[i], df_race["Profitto"].iloc[i]; current_leader = df_race["Leader"].iloc[i] 
                 fig_race.add_trace(go.Scatter(x=[x0, x1], y=[y0, y1], mode='lines+markers', line=dict(color=color_map.get(current_leader, 'grey'), width=4), marker=dict(size=8, color=color_map.get(current_leader, 'grey')), name=current_leader, legendgroup=current_leader, showlegend=False, hovertemplate=f"<b>{current_leader}</b><br>Record: €%{{y:.0f}}<extra></extra>"))
-            
-            for leader in unique_leaders:
-                fig_race.add_trace(go.Scatter(x=[None], y=[None], mode='markers', marker=dict(size=10, color=color_map.get(leader, 'grey')), name=leader, legendgroup=leader, showlegend=True))
-            
-            fig_race.update_layout(xaxis_title=None, yaxis_title="Profitto Record (€)", hovermode="closest")
-            st.plotly_chart(fig_race, use_container_width=True)
-        else:
-            st.info("Dati insufficienti per il grafico del Trono.")
-            
+            for leader in unique_leaders: fig_race.add_trace(go.Scatter(x=[None], y=[None], mode='markers', marker=dict(size=10, color=color_map.get(leader, 'grey')), name=leader, legendgroup=leader, showlegend=True))
+            fig_race.update_layout(xaxis_title=None, yaxis_title="Profitto Record (€)", hovermode="closest"); st.plotly_chart(fig_race, use_container_width=True)
+        else: st.info("Dati insufficienti per il grafico del Trono.")
+        
         st.subheader("💓 Il Polso del Club")
         daily_stats = df_filtered.groupby("Data").agg(Players=("Giocatore", "count"), Pot=("BuyIn", "sum")).sort_index()
         fig_combo = make_subplots(specs=[[{"secondary_y": True}]])
@@ -462,157 +576,44 @@ def mostra_statistiche(club_name, is_host):
         st.dataframe(view_stats.style.format({"Profitto": "€ {:.2f}", "Volume (€)": "€ {:.0f}", "ROI %": "{:.1f}%"}).background_gradient(subset=["Profitto"], cmap="RdYlGn", vmin=-50, vmax=50), use_container_width=True)
 
 def gestisci_storico(club_name, is_host):
-    st.header("📜 Storico Sessioni")
-    if not os.path.exists(GAMES_DB_FILE): st.warning("Nessun database trovato."); return
-    df_global = pd.read_csv(GAMES_DB_FILE)
-    df_club = df_global[df_global["Club"] == club_name].copy()
-    if df_club.empty: st.info("Nessuna sessione registrata."); return
-    df_club["Data"] = pd.to_datetime(df_club["Data"])
-    unique_dates = sorted(df_club["Data"].unique(), reverse=True)
-    st.write(f"Trovate **{len(unique_dates)}** sessioni di gioco.")
-    for i, data_sessione in enumerate(unique_dates):
-        df_session = df_club[df_club["Data"] == data_sessione].copy()
-        pot_sessione = df_session["BuyIn"].sum()
-        top_winner = df_session.loc[df_session["Profitto"].idxmax(), "Giocatore"]
-        top_win_amount = df_session["Profitto"].max()
-        data_str = data_sessione.strftime("%d/%m/%Y")
-        titolo_expander = f"📅 {data_str} — Pot: €{pot_sessione:.0f} — 🦈 {top_winner} (+€{top_win_amount:.0f})"
-        with st.expander(titolo_expander):
-            st.subheader(f"Bilancio Serata del {data_str}")
-            st.bar_chart(df_session.set_index("Giocatore")["Profitto"])
-            st.write("Dettaglio Giocate:")
-            st.dataframe(df_session.style.format({"BuyIn": "€{:.2f}", "CashOut": "€{:.2f}", "Profitto": "€{:.2f}"}), use_container_width=True)
-            if is_host:
-                st.warning("⚠️ Area Modifica (Solo Host)")
-                col_del_1, col_del_2 = st.columns([3, 1])
-                with col_del_1:
-                    id_to_delete = st.selectbox("Seleziona ID riga", df_session.index, key=f"sel_del_{data_str}_{i}")
-                with col_del_2:
-                    st.write(""); st.write("")
-                    if st.button("Elimina", key=f"btn_del_{data_str}_{i}", type="primary"):
-                        df_global = df_global.drop(id_to_delete)
-                        df_global.to_csv(GAMES_DB_FILE, index=False)
-                        st.success(f"Riga {id_to_delete} eliminata!"); st.rerun()
-            else:
-                st.info("🔒 Solo l'Host può eliminare o modificare le sessioni.")
-
-def importa_dati(club_name):
-    st.header("📥 Importa da Excel")
-    st.write("Carica qui il tuo file storico.")
-    st.info("Assicurati che le colonne si chiamino: **Data**, **Giocatore**, **BuyIn**, **CashOut**.")
-    
-    uploaded_file = st.file_uploader("Trascina qui il file (.xlsx o .csv)", type=["xlsx", "csv"])
-    
-    if uploaded_file:
-        try:
-            if uploaded_file.name.endswith('.csv'): 
-                df_new = pd.read_csv(uploaded_file)
-            else: 
-                df_new = pd.read_excel(uploaded_file)
-            
-            df_new.columns = [c.strip() for c in df_new.columns]
-            cols_lower = {c.lower(): c for c in df_new.columns}
-            
-            rename_map = {}
-            if "nome del giocatore" in cols_lower: rename_map[cols_lower["nome del giocatore"]] = "Giocatore"
-            elif "giocatore" in cols_lower: rename_map[cols_lower["giocatore"]] = "Giocatore"
-            
-            if "entrata" in cols_lower: rename_map[cols_lower["entrata"]] = "BuyIn"
-            elif "buyin" in cols_lower: rename_map[cols_lower["buyin"]] = "BuyIn"
-            
-            for col in cols_lower:
-                if "uscita" in col or "cashout" in col:
-                    rename_map[cols_lower[col]] = "CashOut"
-                    break
-            
-            if "data" in cols_lower: rename_map[cols_lower["data"]] = "Data"
-            
-            df_new = df_new.rename(columns=rename_map)
-            
-            required = ["Data", "Giocatore", "BuyIn", "CashOut"]
-            if not all(col in df_new.columns for col in required):
-                st.error(f"Mancano delle colonne o i nomi sono errati. Colonne trovate: {list(df_new.columns)}")
-                st.write("Rinominale nel file Excel in: Data, Giocatore, BuyIn, CashOut")
-            else:
-                for col in ["BuyIn", "CashOut"]:
-                    df_new[col] = df_new[col].astype(str).str.replace('€', '', regex=False)
-                    df_new[col] = df_new[col].str.replace(',', '.', regex=False)
-                    df_new[col] = df_new[col].str.replace('-', '0', regex=False)
-                    df_new[col] = df_new[col].str.strip()
-                    df_new[col] = pd.to_numeric(df_new[col], errors='coerce').fillna(0)
-
-                if "Profitto" not in df_new.columns: 
-                    df_new["Profitto"] = df_new["CashOut"] - df_new["BuyIn"]
-                
-                df_new["Data"] = pd.to_datetime(df_new["Data"], dayfirst=True, errors='coerce')
-                df_new = df_new.dropna(subset=["Data"])
-
-                st.write("Anteprima dati puliti:")
-                st.dataframe(df_new.head())
-                
-                if st.button("✅ Conferma Importazione"):
-                    salva_partita(club_name, df_new)
-                    st.success(f"Importate {len(df_new)} righe con successo!")
-                    st.rerun()
-                    
-        except Exception as e:
-            st.error(f"Errore durante l'importazione: {e}")
+    st.header("📜 Storico (Cloud)")
+    df = carica_dati_club(club_name)
+    if not df.empty:
+        # Pulizia e ordinamento
+        df["Data"] = pd.to_datetime(df["Data"], errors='coerce')
+        df = df.sort_values("Data", ascending=False)
+        st.dataframe(df.style.format({"BuyIn": "€ {:.2f}", "CashOut": "€ {:.2f}", "Profitto": "€ {:.2f}"}))
+    else:
+        st.info("Nessuno storico.")
 
 def dashboard_club(club_name):
     owner = get_club_owner(club_name)
     is_host = (st.session_state.username == owner)
-    if is_host:
-        st.sidebar.markdown(f"### 👑 Pannello Host")
-        st.title(f"🏠 {club_name} (Admin)")
-    else:
-        st.title(f"🏠 {club_name}")
-    opzioni_menu = ["Partita in Corso", "Statistiche", "Storico & Modifica", "Membri"]
-    if is_host:
-        opzioni_menu.append("Importa Dati")
-    menu = st.radio("Menu", opzioni_menu, horizontal=True, label_visibility="collapsed")
-    if menu == "Partita in Corso": 
-        gestisci_partita_live(club_name, is_host)
-    elif menu == "Statistiche": 
-        mostra_statistiche(club_name, is_host)
-    elif menu == "Storico & Modifica": 
-        gestisci_storico(club_name, is_host)
+    st.title(f"🏠 {club_name}")
+    opzioni = ["Partita in Corso", "Statistiche", "Storico", "Membri"]
+    if is_host: opzioni.append("Importa Dati")
+    menu = st.radio("Menu", opzioni, horizontal=True)
+    if menu == "Partita in Corso": gestisci_partita_live(club_name, is_host)
+    elif menu == "Statistiche": mostra_statistiche(club_name, is_host)
+    elif menu == "Storico": gestisci_storico(club_name, is_host)
     elif menu == "Membri":
-        st.subheader("👥 Lista Membri")
-        clubs = carica_json(CLUBS_DB_FILE)
-        current_members = clubs[club_name]["members"]
-        if current_members:
-            df_members = pd.DataFrame(current_members, columns=["Membri del Club"])
-            df_members.index = df_members.index + 1 
-            st.table(df_members)
+        clubs = carica_clubs()
+        st.table(pd.DataFrame(clubs[club_name]["members"], columns=["Membri"]))
         if is_host:
-            st.markdown("---")
-            st.write("### 👑 Invita Giocatore")
-            col1, col2 = st.columns([3,1])
-            with col1: u = st.text_input("Username amico da invitare")
-            with col2: 
-                st.write(""); st.write("") 
-                if st.button("Invita", type="primary"):
-                    res = aggiungi_membro_al_club(club_name, u)
-                    if res == "success": st.success(f"**{u}** aggiunto!"); st.rerun()
-                    elif res == "not_found": st.error("Utente non trovato.")
-                    elif res == "already_in": st.warning("Già presente.")
-        else:
-            st.info("Solo l'Host può invitare nuovi membri.")
-    elif menu == "Importa Dati": 
-        if is_host:
-            importa_dati(club_name)
-        else:
-            st.error("Accesso Negato")
+            u = st.text_input("Username invito")
+            if st.button("Invita") and u: aggiungi_membro_al_club(club_name, u)
+    elif menu == "Importa Dati":
+        if is_host: importa_dati(club_name)
+        else: st.error("Accesso Negato")
 
 def main_app():
     st.sidebar.write(f"Utente: **{st.session_state.username}**")
     if st.sidebar.button("Logout"): st.session_state.logged_in = False; st.rerun()
-    st.sidebar.markdown("---")
+    my_clubs = get_user_clubs(st.session_state.username)
     if not st.session_state.current_club:
         st.header("I tuoi Club")
-        my_clubs = get_user_clubs(st.session_state.username)
         for club in my_clubs:
-            if st.button(f"Entra in {club}", use_container_width=True): st.session_state.current_club = club; st.rerun()
+            if st.button(f"Entra in {club}"): st.session_state.current_club = club; st.rerun()
         with st.expander("Crea Nuovo Club"):
             n = st.text_input("Nome Club")
             if st.button("Crea") and n: crea_club(n, st.session_state.username); st.rerun()

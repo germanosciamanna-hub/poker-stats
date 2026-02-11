@@ -4,3 +4,5 @@ plotly
 openpyxl
 jinja2
 matplotlib
+gspread
+oauth2client
